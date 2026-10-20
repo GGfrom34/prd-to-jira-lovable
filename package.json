@@ -1,0 +1,17 @@
+{
+  "name": "prd-assistant",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "test": "node --test \"tests/**/*.test.ts\"",
+    "typecheck": "tsc --noEmit",
+    "sync-prompts": "node scripts/sync-prompts.ts",
+    "check-prompts": "node scripts/sync-prompts.ts --check",
+    "eval": "node eval/run-eval.ts"
+  },
+  "devDependencies": {
+    "@electric-sql/pglite": "^0.3.0",
+    "@types/node": "^24.0.0",
+    "typescript": "^5.9.0"
+  }
+}
