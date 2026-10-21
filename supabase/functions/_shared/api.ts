@@ -11,12 +11,13 @@ import {
   parseReviewResponse,
   parseSplitResponse,
   resolveChanges,
+  AgentOutputError,
   type AgentRequest,
 } from "./agents.ts";
 import type { MessageParams, MessageResponse } from "./anthropic.ts";
 import type { Config } from "./config.ts";
 import type { Db, Step } from "./db.ts";
-import { MAX_FEEDBACK_CHARS, MAX_PRD_CHARS, estimateTokens, utcDay, visitorKey, withBudget } from "./guardrails.ts";
+import { MAX_FEEDBACK_CHARS, MAX_PRD_CHARS, describeError, estimateTokens, utcDay, visitorKey, withBudget } from "./guardrails.ts";
 import {
   ApiError,
   clientIp,
@@ -40,6 +41,8 @@ export type Deps = {
 };
 
 export const MAX_BODY_CHARS = 100_000;
+// Attempts per Claude step when the reply is malformed.
+export const MAX_ATTEMPTS = 2;
 // The improved PRD can be longer than the pasted one, up to the finalizer's output cap.
 export const MAX_IMPROVED_PRD_CHARS = 20_000;
 // Enough headroom for the first Claude call, so the landing page does not invite a paste it cannot serve.
@@ -98,25 +101,35 @@ async function runAiStep<T>(
 
   let finished = false;
   try {
-    const result = await withBudget({
-      store: deps.db,
-      day: ctx.day,
-      visitor: ctx.visitor,
-      session,
-      estimate: estimateTokens(req.inputChars, req.params.max_tokens),
-      caps: deps.config.caps,
-      call: async () => {
-        const res = await deps.claude(req.params);
-        return { value: res, usage: res.usage };
-      },
-    });
-    if (!result.ok) throw new ApiError(result.reason);
+    // The model occasionally returns a malformed reply (a missing field, a list
+    // flattened or sent as broken text). One more attempt almost always fixes it.
+    // Each attempt is reserved and settled separately, so the caps still hold, and
+    // only a malformed reply is retried, never an API error or a cap denial.
+    let parsed: T | undefined;
+    for (let attempt = 1; parsed === undefined; attempt++) {
+      const result = await withBudget({
+        store: deps.db,
+        day: ctx.day,
+        visitor: ctx.visitor,
+        session,
+        estimate: estimateTokens(req.inputChars, req.params.max_tokens),
+        caps: deps.config.caps,
+        call: async () => {
+          const res = await deps.claude(req.params);
+          return { value: res, usage: res.usage };
+        },
+      });
+      if (!result.ok) throw new ApiError(result.reason, undefined, result.detail);
 
-    let parsed: T;
-    try {
-      parsed = parse(result.value);
-    } catch {
-      throw new ApiError("upstream_error");
+      try {
+        parsed = parse(result.value);
+      } catch (e) {
+        if (attempt >= MAX_ATTEMPTS) {
+          // Schema paths and rules name no user text, so they are safe to return for debugging.
+          const safe = e instanceof SchemaError || e instanceof AgentOutputError;
+          throw new ApiError("upstream_error", undefined, safe ? `${e.name}: ${e.message}` : describeError(e));
+        }
+      }
     }
     await deps.db.finishStep(session, next);
     finished = true;

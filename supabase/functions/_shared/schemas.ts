@@ -2,6 +2,8 @@
 // server actually accepts). The validators are the enforcement: model output is
 // untrusted, and decisions arriving from the browser are too.
 
+import { parseJsonLoosely } from "./json-repair.ts";
+
 export const DIMENSIONS = [
   "problem_statement",
   "success_metrics",
@@ -179,8 +181,107 @@ export function parseSplit(input: unknown): Split {
   };
 }
 
-const text = (maxLength: number) => ({ type: "string", maxLength });
-const nullableText = (maxLength: number) => ({ type: ["string", "null"], maxLength });
+type JsonSchema = {
+  type?: string | string[];
+  enum?: readonly unknown[];
+  properties?: Record<string, JsonSchema>;
+  items?: JsonSchema;
+  maxItems?: number;
+  maxLength?: number;
+};
+
+type EnumRule = [RegExp, string];
+type EnumTable = { allowed: readonly string[]; rules: EnumRule[]; fallback: string };
+
+// Labels the model sometimes invents outside the allowed lists, mapped to the
+// nearest valid one. The label only drives how a finding is displayed, so a
+// close mapping is better than discarding a reply that is otherwise fine.
+const ENUM_TABLES: EnumTable[] = [
+  {
+    allowed: VERDICTS,
+    rules: [[/significant|rework/, "needs_significant_rework"], [/targeted|fix|minor/, "needs_targeted_fixes"], [/ready|good|approv/, "ready"]],
+    fallback: "needs_targeted_fixes",
+  },
+  {
+    allowed: SEVERITIES,
+    rules: [[/block|critical|high|major|severe/, "blocker"], [/nice|low|minor|suggest|optional/, "nice_to_have"], [/gap|medium|moderate|warn/, "gap"]],
+    fallback: "gap",
+  },
+  {
+    allowed: DIMENSIONS,
+    rules: [
+      [/metric|success|kpi|measur/, "success_metrics"],
+      [/rollout|rollback|launch|release/, "rollout_rollback"],
+      [/non_?functional|nfr|perform|secur|privacy|safety|trust|compliance|gdpr|accessib|reliab|availab|retention|data/, "non_functional"],
+      [/edge|error|failure|cancel|dispute|abuse|concurren/, "edge_cases"],
+      [/depend|risk|question|assum/, "dependencies_risks_questions"],
+      [/scope|boundar/, "scope"],
+      [/accept|criteria|requirement|story|feature/, "requirements_acceptance_criteria"],
+      [/problem|context|goal|audience|user/, "problem_statement"],
+    ],
+    fallback: "dependencies_risks_questions",
+  },
+  {
+    allowed: ISSUE_TYPES,
+    rules: [[/task|chore|tech|infra|spike|sub/, "task"], [/story|feature|bug/, "story"]],
+    fallback: "story",
+  },
+];
+
+export function coerceEnum(value: string, allowed: readonly unknown[]): string | null {
+  const canonical = value.trim().toLowerCase().replace(/[^a-z0-9]+/g, "_").replace(/^_+|_+$/g, "");
+  const exact = allowed.find((a) => a === canonical);
+  if (typeof exact === "string") return exact;
+  const table = ENUM_TABLES.find((t) => t.allowed.length === allowed.length && t.allowed.every((a, i) => a === allowed[i]));
+  if (!table) return null;
+  for (const [pattern, label] of table.rules) if (pattern.test(canonical)) return label;
+  return table.fallback;
+}
+
+// Repairs harmless quirks in the model's tool input before it is validated: an
+// array or object sent as JSON text is decoded, and strings and lists longer
+// than the schema allows are clipped rather than failing a reply that has
+// already been paid for, and labels outside an enum are mapped to the nearest
+// valid one. Only used on model output; visitor input stays strict.
+export function normaliseToSchema(value: unknown, schema: JsonSchema): unknown {
+  const types = Array.isArray(schema.type) ? schema.type : schema.type ? [schema.type] : [];
+  if (typeof value === "string" && !types.includes("string") && (types.includes("array") || types.includes("object"))) {
+    try {
+      value = parseJsonLoosely(value);
+    } catch {
+      return value;
+    }
+  }
+  if (Array.isArray(value) && types.includes("array")) {
+    const items = typeof schema.maxItems === "number" ? value.slice(0, schema.maxItems) : value;
+    const itemSchema = schema.items;
+    return itemSchema ? items.map((v) => normaliseToSchema(v, itemSchema)) : items;
+  }
+  if (typeof value === "object" && value !== null && !Array.isArray(value) && types.includes("object") && schema.properties) {
+    const out: Record<string, unknown> = { ...(value as Record<string, unknown>) };
+    for (const [key, sub] of Object.entries(schema.properties)) {
+      if (key in out) out[key] = normaliseToSchema(out[key], sub);
+    }
+    return out;
+  }
+  if (typeof value === "string" && Array.isArray(schema.enum) && !schema.enum.includes(value)) {
+    const label = coerceEnum(value, schema.enum);
+    if (label !== null) return label;
+  }
+  if (typeof value === "string" && types.includes("string") && typeof schema.maxLength === "number" && value.length > schema.maxLength) {
+    return value.slice(0, schema.maxLength - 1) + "…";
+  }
+  return value;
+}
+
+const text = (maxLength: number, description?: string) =>
+  description ? { type: "string", maxLength, description } : { type: "string", maxLength };
+const nullableText = (maxLength: number, description?: string) =>
+  description ? { type: ["string", "null"], maxLength, description } : { type: ["string", "null"], maxLength };
+
+// Strict mode drops the numeric limits from what the model sees, so the field
+// descriptions carry the length guidance. Replies that run long anyway are
+// clipped on the way back by normaliseToSchema.
 
 export const REVIEW_TOOL = {
   name: "report_findings",
@@ -191,20 +292,25 @@ export const REVIEW_TOOL = {
     required: ["verdict", "summary", "findings", "skipped_dimensions"],
     properties: {
       verdict: { type: "string", enum: [...VERDICTS] },
-      summary: text(300),
+      summary: text(300, "One sentence, under 200 characters."),
       findings: {
         type: "array",
         maxItems: 20,
+        description: "At most 12 findings. Merge closely related gaps into one finding and list the most severe first.",
         items: {
           type: "object",
           additionalProperties: false,
           required: ["dimension", "severity", "section", "issue"],
           properties: {
-            dimension: { type: "string", enum: [...DIMENSIONS] },
+            dimension: {
+              type: "string",
+              enum: [...DIMENSIONS],
+              description: "The closest of the eight rubric dimensions. If a gap fits none exactly, use dependencies_risks_questions.",
+            },
             severity: { type: "string", enum: [...SEVERITIES] },
-            section: text(200),
-            quote: nullableText(400),
-            issue: text(700),
+            section: text(200, "The PRD section, under 60 characters."),
+            quote: nullableText(400, "A short verbatim excerpt under 150 characters, or null."),
+            issue: text(700, "One or two sentences, under 300 characters."),
           },
         },
       },
@@ -215,10 +321,10 @@ export const REVIEW_TOOL = {
           type: "object",
           additionalProperties: false,
           required: ["dimension", "reason"],
-          properties: { dimension: { type: "string", enum: [...DIMENSIONS] }, reason: text(300) },
+          properties: { dimension: { type: "string", enum: [...DIMENSIONS] }, reason: text(300, "Under 150 characters.") },
         },
       },
-      strengths: nullableText(400),
+      strengths: nullableText(400, "One short sentence, or null."),
     },
   },
 } as const;
@@ -240,9 +346,9 @@ export const IMPROVE_TOOL = {
           required: ["finding_id", "question", "proposed_text"],
           properties: {
             finding_id: text(20),
-            question: text(300),
-            before: nullableText(1500),
-            proposed_text: text(2500),
+            question: text(300, "One short question, under 150 characters."),
+            before: nullableText(1500, "The shortest exact excerpt that identifies the text being replaced, under 300 characters, or null."),
+            proposed_text: text(2500, "A concise draft, under 600 characters."),
           },
         },
       },
@@ -273,21 +379,27 @@ export const SPLIT_TOOL = {
         type: "object",
         additionalProperties: false,
         required: ["title", "description"],
-        properties: { title: text(120), description: text(3000) },
+        properties: { title: text(120, "Under 80 characters."), description: text(3000, "Under 800 characters.") },
       },
       issues: {
         type: "array",
         minItems: 1,
         maxItems: 15,
+        description: "At most 10 issues.",
         items: {
           type: "object",
           additionalProperties: false,
           required: ["type", "title", "description", "acceptance_criteria"],
           properties: {
             type: { type: "string", enum: [...ISSUE_TYPES] },
-            title: text(120),
-            description: text(2000),
-            acceptance_criteria: { type: "array", maxItems: 10, items: text(300) },
+            title: text(120, "Under 80 characters."),
+            description: text(2000, "Under 400 characters."),
+            acceptance_criteria: {
+              type: "array",
+              maxItems: 10,
+              description: "At most 6 criteria, each under 150 characters.",
+              items: text(300),
+            },
           },
         },
       },

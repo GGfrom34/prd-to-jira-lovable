@@ -207,6 +207,8 @@ test("a failed Claude call returns 502, stays charged at the reserve, and can be
   const r = await h.call("POST", "review", { session_id: session, prd: PRD });
   assert.equal(r.status, 502);
   assert.equal(r.json.error.code, "upstream_error");
+  assert.equal(r.json.error.detail, "Error", "the class is reported, the message is not");
+  assert.equal(JSON.stringify(r.json).includes("socket hang up"), false);
   assert.deepEqual(await h.stepOf(session), { step: "new", busy: false });
 
   const req = buildReviewRequest(PRD);
@@ -228,19 +230,122 @@ test("a rate-limited Claude call shows the capacity message with 429", async () 
   assert.equal(r.json.error.message, MESSAGES.rate_limited);
 });
 
-test("model output that fails validation is a 502 charged at its real usage, with the step released", async () => {
+test("model output that keeps failing validation is tried twice, then a 502 charged at its real usage for both", async () => {
   const h = await harness({ claude: async () => toolReply("report_findings", { verdict: "great" }) });
   const session = await h.session();
   const r = await h.call("POST", "review", { session_id: session, prd: PRD });
+  assert.equal(h.claudeCalls.length, 2);
   assert.equal(r.status, 502);
+  assert.match(r.json.error.detail, /^SchemaError: summary/);
+  assert.ok(r.json.error.detail.endsWith("[sent: verdict=string(5) summary=string(1) findings=array(2) skipped_dimensions=array(0)]") || r.json.error.detail.includes("[sent: verdict=string(5)"), r.json.error.detail);
   assert.deepEqual(await h.stepOf(session), { step: "new", busy: false });
-  assert.equal(await h.globalUsed(), USAGE.report_findings.input_tokens + USAGE.report_findings.output_tokens);
+  assert.equal(await h.globalUsed(), 2 * (USAGE.report_findings.input_tokens + USAGE.report_findings.output_tokens));
+});
+
+test("a malformed reply is retried once and the visitor just gets the good answer", async () => {
+  let calls = 0;
+  const h = await harness({
+    claude: async () => {
+      calls += 1;
+      return calls === 1 ? toolReply("report_findings", { summary: "no verdict, no findings" }) : toolReply("report_findings");
+    },
+  });
+  const session = await h.session();
+  const r = await h.call("POST", "review", { session_id: session, prd: PRD });
+  assert.equal(r.status, 200, JSON.stringify(r.json));
+  assert.equal(calls, 2);
+  assert.equal(r.json.findings.length, 2);
+  assert.deepEqual(await h.stepOf(session), { step: "reviewed", busy: false });
+  assert.equal(await h.globalUsed(), 2 * (USAGE.report_findings.input_tokens + USAGE.report_findings.output_tokens), "both attempts are charged");
+});
+
+test("an API error is not retried, and a good reply is not called twice", async () => {
+  let failing = 0;
+  const h = await harness({
+    claude: async () => {
+      failing += 1;
+      throw new Error("upstream down");
+    },
+  });
+  const session = await h.session();
+  const r = await h.call("POST", "review", { session_id: session, prd: PRD });
+  assert.equal(r.status, 502);
+  assert.equal(failing, 1, "only malformed replies are retried");
+
+  const ok = await harness();
+  const s2 = await ok.session();
+  await ok.call("POST", "review", { session_id: s2, prd: PRD });
+  assert.equal(ok.claudeCalls.length, 1);
+});
+
+test("the retry is checked against the caps like any other call", async () => {
+  const estimate = estimateTokens(buildReviewRequest(PRD).inputChars, buildReviewRequest(PRD).params.max_tokens);
+  const h = await harness({
+    config: { caps: { global: 1_000_000, visitor: 1_000_000, session: estimate + 100 } },
+    claude: async () => toolReply("report_findings", { verdict: "great" }),
+  });
+  const session = await h.session();
+  const r = await h.call("POST", "review", { session_id: session, prd: PRD });
+  assert.equal(r.status, 429);
+  assert.equal(r.json.error.code, "session_cap");
+  assert.equal(h.claudeCalls.length, 1, "the second attempt was refused before reaching Claude");
+  assert.deepEqual(await h.stepOf(session), { step: "new", busy: false });
+});
+
+test("a list the model sends as JSON text, or an over-long field, is repaired and the call succeeds", async () => {
+  const stringified = await harness({
+    claude: async () => toolReply("report_findings", { verdict: "needs_targeted_fixes", summary: "x", findings: JSON.stringify(FINDINGS), skipped_dimensions: [] }),
+  });
+  const s1 = await stringified.session();
+  const r1 = await stringified.call("POST", "review", { session_id: s1, prd: PRD });
+  assert.equal(r1.status, 200);
+  assert.equal(r1.json.findings.length, 2);
+  assert.deepEqual(await stringified.stepOf(s1), { step: "reviewed", busy: false });
+
+  const overlong = await harness({
+    claude: async () => toolReply("report_findings", { verdict: "ready", summary: "x".repeat(500), findings: [], skipped_dimensions: [] }),
+  });
+  const s2 = await overlong.session();
+  const r2 = await overlong.call("POST", "review", { session_id: s2, prd: PRD });
+  assert.equal(r2.status, 200);
+  assert.equal(r2.json.summary.length, 300);
+});
+
+test("labels the model invents are mapped to the nearest valid one and the call succeeds", async () => {
+  const h = await harness({
+    claude: async () =>
+      toolReply("report_findings", {
+        verdict: "Needs significant rework",
+        summary: "x",
+        findings: [{ dimension: "trust_and_safety", severity: "Critical", section: "Scope", quote: null, issue: "No sitter verification." }],
+        skipped_dimensions: [],
+      }),
+  });
+  const session = await h.session();
+  const r = await h.call("POST", "review", { session_id: session, prd: PRD });
+  assert.equal(r.status, 200, JSON.stringify(r.json));
+  assert.equal(r.json.verdict, "needs_significant_rework");
+  assert.deepEqual([r.json.findings[0].dimension, r.json.findings[0].severity], ["non_functional", "blocker"]);
+});
+
+test("an unrepairable list reports where the JSON broke, as numbers only", async () => {
+  const bad = '[{"issue": "a list that is cut off SENTINEL_PRD_TEXT';
+  const h = await harness({
+    claude: async () => toolReply("report_findings", { verdict: "ready", summary: "x", findings: bad, skipped_dimensions: [] }),
+  });
+  const session = await h.session();
+  const r = await h.call("POST", "review", { session_id: session, prd: PRD });
+  assert.equal(r.status, 502);
+  assert.match(r.json.error.detail, /findings=string\(\d+,json-error@\d+:code-?\d+\)/);
+  assert.equal(JSON.stringify(r.json).includes("SENTINEL"), false);
 });
 
 test("a truncated model response is a 502 and the step stays retryable", async () => {
   const h = await harness({ claude: async () => ({ ...toolReply("report_findings"), stop_reason: "max_tokens" }) });
   const session = await h.session();
-  assert.equal((await h.call("POST", "review", { session_id: session, prd: PRD })).status, 502);
+  const r = await h.call("POST", "review", { session_id: session, prd: PRD });
+  assert.equal(r.status, 502);
+  assert.ok(r.json.error.detail.startsWith("AgentOutputError: Response was cut off (500 output tokens; findings:2") && r.json.error.detail.includes("findings=array(2)"), r.json.error.detail);
   assert.deepEqual(await h.stepOf(session), { step: "new", busy: false });
 });
 

@@ -17,6 +17,8 @@ import {
   parseFinalPrd,
   parseImprovement,
   parseReview,
+  SchemaError,
+  normaliseToSchema,
   parseSplit,
   type Decision,
   type IdentifiedFinding,
@@ -27,7 +29,7 @@ import {
 export const DEFAULT_MODEL = "claude-sonnet-5";
 
 // A truncated tool call is invalid JSON, so these are sized generously.
-export const MAX_TOKENS = { review: 2500, improve: 4000, finalize: 6000, split: 3000, revise: 3000 } as const;
+export const MAX_TOKENS = { review: 4500, improve: 6000, finalize: 6000, split: 4000, revise: 4000 } as const;
 
 export type AgentRequest = { params: MessageParams; inputChars: number };
 
@@ -52,6 +54,9 @@ function request(
       max_tokens: maxTokens,
       system,
       messages: [{ role: "user", content: user }],
+      // Not strict: strict mode hides the length limits from the model, and it then
+      // sometimes runs on until the output cap. Label and shape slips are repaired
+      // by normaliseToSchema instead.
       tools: [tool],
       tool_choice: { type: "tool", name: tool.name },
     },
@@ -115,17 +120,75 @@ export function buildReviseRequest(prd: string, previous: Split, feedback: strin
   return request(model, MAX_TOKENS.revise, REVISER_SYSTEM, user, SPLIT_TOOL);
 }
 
-function toolInput(response: MessageResponse, toolName: string): unknown {
-  if (response.stop_reason === "max_tokens") throw new AgentOutputError("Response was cut off");
-  const block = response.content.find(
-    (b: ContentBlock): b is Extract<ContentBlock, { type: "tool_use" }> => b.type === "tool_use" && b.name === toolName,
-  );
-  if (!block) throw new AgentOutputError("Model did not call the expected tool");
-  return block.input;
+// Sizes only (list lengths and the longest string), never content, so it is safe to report.
+function describeShape(input: unknown): string {
+  let longest = 0;
+  const lists: string[] = [];
+  const walk = (x: unknown, key: string): void => {
+    if (typeof x === "string") longest = Math.max(longest, x.length);
+    else if (Array.isArray(x)) {
+      lists.push(`${key}:${x.length}`);
+      x.forEach((item) => walk(item, key));
+    } else if (typeof x === "object" && x !== null) {
+      for (const [k, v] of Object.entries(x)) walk(v, k);
+    }
+  };
+  walk(input, "root");
+  return `${lists.join(" ")} longest string ${longest} chars`.trim();
 }
 
-export const parseReviewResponse = (res: MessageResponse) => parseReview(toolInput(res, REVIEW_TOOL.name));
+// For text that looks like JSON, where the first parse error is: a position and a
+// character code, never the text itself.
+function jsonProbe(text: string): string {
+  if (!/^\s*[[{]/.test(text)) return "";
+  try {
+    JSON.parse(text);
+    return ",json-ok";
+  } catch (e) {
+    const m = /position (\d+)/.exec(String(e));
+    const pos = m ? Number(m[1]) : -1;
+    // -1 when the text simply ended, so there is no character at that position.
+    return `,json-error@${pos}:code${pos >= 0 && pos < text.length ? text.charCodeAt(pos) : -1}`;
+  }
+}
+
+// Top-level field names with their type and size, never values.
+function describeFields(input: unknown): string {
+  if (typeof input !== "object" || input === null) return `input is ${typeof input}`;
+  return Object.entries(input)
+    .map(([key, v]) => {
+      if (typeof v === "string") return `${key}=string(${v.length}${jsonProbe(v)})`;
+      if (Array.isArray(v)) return `${key}=array(${v.length})`;
+      return `${key}=${v === null ? "null" : typeof v}`;
+    })
+    .join(" ");
+}
+
+function toolInput(response: MessageResponse, tool: { name: string; input_schema: object }): { input: unknown; fields: string } {
+  const block = response.content.find(
+    (b: ContentBlock): b is Extract<ContentBlock, { type: "tool_use" }> => b.type === "tool_use" && b.name === tool.name,
+  );
+  if (response.stop_reason === "max_tokens") {
+    throw new AgentOutputError(`Response was cut off (${response.usage.output_tokens} output tokens; ${describeShape(block?.input)}; ${describeFields(block?.input)})`);
+  }
+  if (!block) throw new AgentOutputError("Model did not call the expected tool");
+  return { input: normaliseToSchema(block.input, tool.input_schema), fields: describeFields(block.input) };
+}
+
+// A validation failure also says what shape the model actually sent, to make
+// intermittent model-output problems diagnosable without logging any content.
+function parseTool<T>(res: MessageResponse, tool: { name: string; input_schema: object }, parse: (input: unknown) => T): T {
+  const { input, fields } = toolInput(res, tool);
+  try {
+    return parse(input);
+  } catch (e) {
+    if (e instanceof SchemaError) throw new SchemaError(e.path, `${e.message.slice(e.path.length + 2)} [sent: ${fields}]`);
+    throw e;
+  }
+}
+
+export const parseReviewResponse = (res: MessageResponse) => parseTool(res, REVIEW_TOOL, parseReview);
 export const parseImproveResponse = (res: MessageResponse, validIds: ReadonlySet<string>) =>
-  parseImprovement(toolInput(res, IMPROVE_TOOL.name), validIds);
-export const parseFinalizeResponse = (res: MessageResponse) => parseFinalPrd(toolInput(res, FINALIZE_TOOL.name));
-export const parseSplitResponse = (res: MessageResponse) => parseSplit(toolInput(res, SPLIT_TOOL.name));
+  parseTool(res, IMPROVE_TOOL, (input) => parseImprovement(input, validIds));
+export const parseFinalizeResponse = (res: MessageResponse) => parseTool(res, FINALIZE_TOOL, parseFinalPrd);
+export const parseSplitResponse = (res: MessageResponse) => parseTool(res, SPLIT_TOOL, parseSplit);

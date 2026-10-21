@@ -114,7 +114,7 @@ test("a call that throws stays charged at the full reserve", async () => {
   const r = await run(5000, async () => {
     throw new Error("socket hang up");
   });
-  assert.deepEqual(r, { ok: false, reason: "upstream_error", message: MESSAGES.upstream_error });
+  assert.deepEqual(r, { ok: false, reason: "upstream_error", message: MESSAGES.upstream_error, detail: "Error" });
   assert.deepEqual(await counters(db, DAY, "v1", session), { global: 5000, visitor: 5000, session: 5000 });
 });
 
@@ -126,13 +126,27 @@ test("rate-limit errors, including exhausted credit, map to the capacity message
   const byName = await run(100, async () => {
     throw named;
   });
-  assert.deepEqual(byName, { ok: false, reason: "rate_limited", message: MESSAGES.rate_limited });
+  assert.deepEqual(byName, { ok: false, reason: "rate_limited", message: MESSAGES.rate_limited, detail: "RateLimitError" });
 
   const byStatus = Object.assign(new Error("Too many requests"), { status: 429 });
   const r2 = await run(100, async () => {
     throw byStatus;
   });
   assert.equal(r2.ok === false && r2.reason, "rate_limited");
+});
+
+test("the failure detail is the error class and status only, never its message", async () => {
+  const { run } = await setup();
+  const err = Object.assign(new Error("echoed SENTINEL_PRD_TEXT and sk-ant-secret"), { name: "AnthropicError", status: 529 });
+  const r = await run(100, async () => {
+    throw err;
+  });
+  assert.equal(r.ok === false && r.detail, "AnthropicError 529");
+  assert.equal(JSON.stringify(r).includes("SENTINEL"), false);
+  const odd = await run(100, async () => {
+    throw "a string, not an Error";
+  });
+  assert.equal(odd.ok === false && odd.detail, "unknown");
 });
 
 test("a failed settle still returns the reply the visitor already paid for", async () => {

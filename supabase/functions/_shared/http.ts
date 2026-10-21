@@ -48,10 +48,12 @@ const STATUS: Record<ErrorCode, number> = {
 
 export class ApiError extends Error {
   code: ErrorCode;
-  constructor(code: ErrorCode, message?: string) {
+  detail?: string;
+  constructor(code: ErrorCode, message?: string, detail?: string) {
     super(message ?? messageFor(code));
     this.name = "ApiError";
     this.code = code;
+    this.detail = detail;
   }
 }
 
@@ -82,7 +84,9 @@ export function jsonResponse(body: unknown, status: number, extra: Record<string
 }
 
 export function errorResponse(err: ApiError, extra: Record<string, string> = {}): Response {
-  return jsonResponse({ ok: false, error: { code: err.code, message: err.message } }, statusFor(err.code), extra);
+  const error: { code: string; message: string; detail?: string } = { code: err.code, message: err.message };
+  if (err.detail) error.detail = err.detail;
+  return jsonResponse({ ok: false, error }, statusFor(err.code), extra);
 }
 
 export async function readJson(req: Request, maxChars: number): Promise<Record<string, unknown>> {

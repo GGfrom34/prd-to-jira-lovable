@@ -108,15 +108,22 @@ export function totalTokens(usage: Usage): number {
 
 export type GuardedResult<T> =
   | { ok: true; value: T; tokens: number }
-  | { ok: false; reason: FailReason; message: string };
+  | { ok: false; reason: FailReason; message: string; detail?: string };
 
 function isRateLimit(err: unknown): boolean {
   if (!(err instanceof Error)) return false;
   return err.name === "RateLimitError" || (err as { status?: number }).status === 429;
 }
 
-function fail<T>(reason: FailReason): GuardedResult<T> {
-  return { ok: false, reason, message: MESSAGES[reason] };
+function fail<T>(reason: FailReason, detail?: string): GuardedResult<T> {
+  return detail === undefined ? { ok: false, reason, message: MESSAGES[reason] } : { ok: false, reason, message: MESSAGES[reason], detail };
+}
+
+// Error class and HTTP status only, never the message: it could echo request content.
+export function describeError(err: unknown): string {
+  if (!(err instanceof Error)) return "unknown";
+  const status = (err as { status?: number }).status;
+  return status === undefined ? err.name : `${err.name} ${status}`;
 }
 
 export type WithBudgetOptions<T> = {
@@ -142,7 +149,7 @@ export async function withBudget<T>(opts: WithBudgetOptions<T>): Promise<Guarded
   try {
     outcome = await opts.call();
   } catch (err) {
-    return fail(isRateLimit(err) ? "rate_limited" : "upstream_error");
+    return fail(isRateLimit(err) ? "rate_limited" : "upstream_error", describeError(err));
   }
 
   const tokens = totalTokens(outcome.usage);

@@ -64,6 +64,21 @@ test("every request forces exactly one tool and uses the default model and its t
   }
 });
 
+test("tools are not sent in strict mode, so the model sees the length limits", () => {
+  const reqs = [
+    buildReviewRequest(PRD),
+    buildImproveRequest(PRD, findings),
+    buildFinalizeRequest(PRD, []),
+    buildSplitRequest(PRD),
+    buildReviseRequest(PRD, split, "x"),
+  ];
+  for (const r of reqs) {
+    const tool = r.params.tools[0] as { name: string; strict?: boolean; input_schema: object };
+    assert.equal(tool.strict, undefined, `${tool.name} must not be strict`);
+    assert.match(JSON.stringify(tool.input_schema), /maxLength/, `${tool.name} should show its length limits`);
+  }
+});
+
 test("a custom model overrides the default", () => {
   assert.equal(buildReviewRequest(PRD, "claude-haiku-4-5-20251001").params.model, "claude-haiku-4-5-20251001");
 });
@@ -164,7 +179,7 @@ test("a truncated response, a missing tool call or the wrong tool is an AgentOut
 test("model output that breaks the schema is a SchemaError, not silently accepted", () => {
   assert.throws(() => parseReviewResponse(toolResponse("report_findings", { verdict: "great" })), SchemaError);
   assert.throws(
-    () => parseSplitResponse(toolResponse("propose_breakdown", { ...split, issues: [{ ...split.issues[0], type: "subtask" }] })),
+    () => parseSplitResponse(toolResponse("propose_breakdown", { ...split, issues: [] })),
     SchemaError,
   );
 });

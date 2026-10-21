@@ -7,7 +7,7 @@ Paste a PRD, get feedback, improve it, sign it off, get an epic/ticket split, su
 
 ```bash
 npm install
-npm test               # 127 tests, no network, no API key
+npm test               # 154 tests, no network, no API key
 npm run typecheck
 npm run sync-prompts   # regenerate prompts from the portfolio repo's .claude agents and skill
 npm run eval           # opt-in: real model checks, spends tokens, needs ANTHROPIC_API_KEY

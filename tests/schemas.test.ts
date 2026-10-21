@@ -12,6 +12,12 @@ import {
   parseImprovement,
   parseReview,
   parseSplit,
+  ISSUE_TYPES,
+  SEVERITIES,
+  VERDICTS,
+  coerceEnum,
+  normaliseToSchema,
+  parseFindings,
   withIds,
 } from "../supabase/functions/_shared/schemas.ts";
 
@@ -117,6 +123,86 @@ test("parseSplit accepts story and task, rejects sub-tasks and an empty issue li
 test("parseSplit treats missing acceptance criteria as an empty list", () => {
   const { acceptance_criteria: _a, ...noAc } = split.issues[0];
   assert.deepEqual(parseSplit({ ...split, issues: [noAc] }).issues[0].acceptance_criteria, []);
+});
+
+test("normaliseToSchema decodes a list the model sent as JSON text (the production failure)", () => {
+  const sent = { ...review, findings: JSON.stringify([finding]) };
+  assert.throws(() => parseReview(sent), /findings: expected an array/);
+  const fixed = parseReview(normaliseToSchema(sent, REVIEW_TOOL.input_schema));
+  assert.equal(fixed.findings.length, 1);
+  assert.equal(fixed.findings[0].dimension, "success_metrics");
+});
+
+test("normaliseToSchema decodes a whole input sent as JSON text, and nested lists too", () => {
+  const whole = JSON.stringify({ ...review, skipped_dimensions: JSON.stringify([{ dimension: "scope", reason: "n/a" }]) });
+  const fixed = parseReview(normaliseToSchema(whole, REVIEW_TOOL.input_schema));
+  assert.equal(fixed.skipped_dimensions[0].dimension, "scope");
+});
+
+test("normaliseToSchema clips over-long strings and lists instead of failing a paid reply", () => {
+  const long = {
+    ...review,
+    summary: "s".repeat(400),
+    findings: Array.from({ length: 25 }, () => ({ ...finding, issue: "i".repeat(900), quote: "q".repeat(500) })),
+  };
+  const fixed = parseReview(normaliseToSchema(long, REVIEW_TOOL.input_schema));
+  assert.equal(fixed.summary.length, 300);
+  assert.ok(fixed.summary.endsWith("…"));
+  assert.equal(fixed.findings.length, 20);
+  assert.equal(fixed.findings[0].issue.length, 700);
+  assert.equal(fixed.findings[0].quote?.length, 400);
+});
+
+test("normaliseToSchema leaves valid input, nulls and string fields alone", () => {
+  assert.deepEqual(normaliseToSchema(review, REVIEW_TOOL.input_schema), review);
+  const nullQuote = { ...review, findings: [{ ...finding, quote: null }] };
+  assert.deepEqual(normaliseToSchema(nullQuote, REVIEW_TOOL.input_schema), nullQuote);
+  const md = { prd_markdown: '["this is markdown, not a list"]' };
+  assert.deepEqual(normaliseToSchema(md, FINALIZE_TOOL.input_schema), md);
+});
+
+test("normaliseToSchema cannot rescue text that is not valid JSON, so validation still fails", () => {
+  const broken = { ...review, findings: "not json at all" };
+  assert.throws(() => parseReview(normaliseToSchema(broken, REVIEW_TOOL.input_schema)), /findings: expected an array/);
+});
+
+test("coerceEnum accepts exact and differently formatted labels", () => {
+  assert.equal(coerceEnum("needs_significant_rework", [...VERDICTS]), "needs_significant_rework");
+  assert.equal(coerceEnum("Needs significant rework", [...VERDICTS]), "needs_significant_rework");
+  assert.equal(coerceEnum("NEEDS-TARGETED-FIXES", [...VERDICTS]), "needs_targeted_fixes");
+  assert.equal(coerceEnum("Blocker", [...SEVERITIES]), "blocker");
+  assert.equal(coerceEnum("Success Metrics", [...DIMENSIONS]), "success_metrics");
+});
+
+test("coerceEnum maps invented labels to the nearest valid one, with a sensible fallback", () => {
+  assert.equal(coerceEnum("trust_and_safety", [...DIMENSIONS]), "non_functional");
+  assert.equal(coerceEnum("security", [...DIMENSIONS]), "non_functional");
+  assert.equal(coerceEnum("payments_and_cancellation", [...DIMENSIONS]), "edge_cases");
+  assert.equal(coerceEnum("something unrelated", [...DIMENSIONS]), "dependencies_risks_questions");
+  assert.equal(coerceEnum("critical", [...SEVERITIES]), "blocker");
+  assert.equal(coerceEnum("minor", [...SEVERITIES]), "nice_to_have");
+  assert.equal(coerceEnum("subtask", [...ISSUE_TYPES]), "task");
+  assert.equal(coerceEnum("partially ready", [...VERDICTS]), "ready");
+  assert.equal(coerceEnum("unknown thing", [...VERDICTS]), "needs_targeted_fixes");
+  assert.equal(coerceEnum("x", ["a", "b"]), null, "an enum with no mapping table is left alone");
+});
+
+test("normaliseToSchema repairs invented labels in a model review, so it validates", () => {
+  const sent = {
+    ...review,
+    verdict: "Needs significant rework",
+    findings: [{ ...finding, dimension: "trust_and_safety", severity: "Critical" }],
+  };
+  assert.throws(() => parseReview(sent), /verdict/);
+  const fixed = parseReview(normaliseToSchema(sent, REVIEW_TOOL.input_schema));
+  assert.equal(fixed.verdict, "needs_significant_rework");
+  assert.equal(fixed.findings[0].dimension, "non_functional");
+  assert.equal(fixed.findings[0].severity, "blocker");
+});
+
+test("visitor-supplied labels are still validated strictly", () => {
+  assert.throws(() => parseDecisions([{ finding_id: "f1", action: "Accept it" }], new Set(["f1"])), /action/);
+  assert.throws(() => parseFindings([{ ...finding, severity: "Critical" }]), /severity/);
 });
 
 test("the tool JSON schemas stay in step with the validators", () => {
