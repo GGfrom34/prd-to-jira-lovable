@@ -1,0 +1,39 @@
+name: Tests
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+# Read-only: the tests need no secrets and nothing to write back.
+permissions:
+  contents: read
+
+# A newer push to the same branch makes an older run pointless.
+concurrency:
+  group: tests-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v7
+
+      # Node 24 runs the TypeScript tests directly, with no build step.
+      - uses: actions/setup-node@v7
+        with:
+          node-version: 24
+          cache: npm
+
+      - run: npm ci
+
+      - name: Type check
+        run: npm run typecheck
+
+      # No API key and no network: Claude, Supabase and the Sheet are faked, and the
+      # SQL runs in an in-process Postgres. The tests that compare against the
+      # portfolio repo's agent files skip themselves when that repo is absent.
+      - name: Tests
+        run: npm test
