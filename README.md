@@ -1,4 +1,7 @@
 # prd-to-jira-lovable
+
+[![Tests](https://github.com/GGfrom34/prd-to-jira-lovable/actions/workflows/test.yml/badge.svg)](https://github.com/GGfrom34/prd-to-jira-lovable/actions/workflows/test.yml)
+
 This repo will support a Frontend prototype built with Lovable. The prototype is targeted at Product Managers and its goal is to help them efficiently convert Product Requirement Documents (PRDs) into well scoped Jira epic and issue tickets. 
 
 Paste a PRD, get feedback, improve it, sign it off, get an epic/ticket split, submit a Jira link, then rate the tool. A Lovable frontend calls one Supabase Edge Function (`supabase/functions/api`). Claude calls are capped per session, per visitor and globally per day.
