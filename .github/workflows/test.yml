@@ -2,7 +2,7 @@ name: Tests
 
 on:
   push:
-    branches: [main]
+    branches: ['**']
   pull_request:
 
 # Read-only: the tests need no secrets and nothing to write back.
