@@ -14,6 +14,7 @@
 - Add the Lovable preview URL, the published URL and any custom domain to the backend's `ALLOWED_ORIGINS` secret. Requests from an unlisted origin fail with a CORS error.
 - Set `VITE_API_BASE_URL` to `https://<project-ref>.supabase.co/functions/v1/api`. The API is public, so the frontend needs no key at all.
 - Fill the placeholder for Anthropic's data-retention link in the privacy notice (section 6). I have not invented a URL.
+- The privacy notice now also discloses Cloudflare's security cookie. If the live app still shows the earlier wording, ask Lovable to update it to the section 6 text.
 - Check whether Lovable overwrites hand-edited files under `supabase/`, and whether a free-plan "built with Lovable" badge loads anything third-party. Both are unverified.
 - The five survey questions come from the backend (`survey.ts`). Edit their wording there, not in the frontend.
 - Skipping the survey is allowed (a quiet link). Remove it if you want every visitor to answer.
@@ -29,7 +30,7 @@ All intelligence lives in a backend API (section 4). The frontend only collects 
 
 ### 2. Hard rules (these override everything else)
 1. **Never call Anthropic or any AI provider from the browser.** The only network target is `VITE_API_BASE_URL`.
-2. **Hold all visitor content in React state only.** No `localStorage`, `sessionStorage`, IndexedDB, cookies or URL parameters for the PRD, findings, proposals, split, Jira link, session id or ratings. A refresh intentionally starts over.
+2. **Hold all visitor content in React state only.** No `localStorage`, `sessionStorage`, IndexedDB, cookies or URL parameters for the PRD, findings, proposals, split, Jira link, session id or ratings. A refresh intentionally starts over. The app's own code must set no cookies at all. (The security layer in front of the API, Cloudflare via Supabase, sets a short-lived `__cf_bm` bot-protection cookie on `supabase.co` responses. That is outside the app's control, so the privacy notice discloses it.)
 3. **No analytics, trackers, third-party scripts, embeds or CDN-hosted web fonts.** Use the system font stack. (Fetching fonts from a third party discloses the visitor's IP, which this project avoids for privacy reasons.)
 4. **Never log request or response bodies** (`console.log` of anything the visitor typed or received is forbidden).
 5. **Render all returned text as plain text or sanitised Markdown.** No `dangerouslySetInnerHTML`, no raw HTML in Markdown (do not enable `rehype-raw`).
@@ -157,7 +158,7 @@ While a request is in flight: disable the triggering button, show a spinner and 
 
 ### 6. Copy
 **Privacy notice (Screen 0)**
-> Your PRD is sent to Anthropic's Claude API to produce feedback, and nothing you paste is stored by this prototype. Please don't paste confidential or personal data. Only a usage counter and, if you choose to answer it, five 1-5 ratings are kept. Your IP address is never stored: a one-way hash that changes every day is used to limit usage and is deleted after two days. Anthropic's handling of API data is described in [link to Anthropic's current data retention terms].
+> Your PRD is sent to Anthropic's Claude API to produce feedback, and nothing you paste is stored by this prototype. Please don't paste confidential or personal data. Only a usage counter and, if you choose to answer it, five 1-5 ratings are kept. Your IP address is never stored: a one-way hash that changes every day is used to limit usage and is deleted after two days. This prototype sets no cookies and uses no analytics, although the security layer in front of the service may set a short-lived cookie to block automated traffic. Anthropic's handling of API data is described in [link to Anthropic's current data retention terms].
 
 **Explainer (Screen 5, after the link is accepted)**
 > **This prototype stops here.** It doesn't have a Jira integration, so it hasn't created any tickets. Your link was only checked for its format, wasn't opened and hasn't been saved. A full version would connect to Jira through Atlassian's MCP server and create the Epic and issues for you. For now, copy the breakdown above into Jira yourself.
@@ -218,7 +219,8 @@ const mockSplit = {
 - [ ] Improve cannot be submitted until every blocker and gap has a choice.
 - [ ] The revise box disappears after one use. The survey cannot be submitted with an unanswered question, and has no free-text field.
 - [ ] Refreshing the page loses everything and returns to Screen 0.
-- [ ] DevTools shows no `localStorage`, `sessionStorage`, cookies or third-party requests.
+- [ ] DevTools shows no `localStorage`, `sessionStorage` or IndexedDB entries, and no cookies set by the app itself. The only cookie expected is Cloudflare's `__cf_bm` on `supabase.co`, set by the infrastructure in front of the API.
+- [ ] The only network hosts are the Supabase API host and, when clicked, the privacy link. Lovable's own preview tooling may add others, so check this on the published site, not only in the preview.
 - [ ] The built bundle contains no AI provider URL and no key or secret of any kind.
 - [ ] The app is usable at 375px width and fully by keyboard.
 - [ ] With the real API (`VITE_USE_MOCK=false`): `GET /status` succeeds from the Lovable preview origin (CORS), and a full real run completes.
